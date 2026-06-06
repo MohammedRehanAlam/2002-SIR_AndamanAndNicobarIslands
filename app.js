@@ -6,7 +6,7 @@ const AUTO_LOAD_DB = true; // Set to true to automatically load the database on 
 const SNIPPET_RADIUS = 100;
 const ENABLE_INDEXING = true;
 const COMPRESSED_SEARCH_INDEXES = true; // Set to true to use compressed search indexes (.json.gz) by default
-const MIN_FOLDER_DEPTH = 1; // Developer can change this to 1, 3, etc.
+const MIN_FOLDER_DEPTH = 0; // Developer can change this to 1, 3, etc.
 
 if (typeof pdfjsLib !== 'undefined')
   pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
@@ -1000,40 +1000,66 @@ async function extractPDF(f) {
     });
     rows.sort((a, b) => b.y - a.y);
 
-    // Global Column Alignment: find common X-starts that occur across rows
-    const xStarts = tc.items.map(it => it.transform[4]).sort((a, b) => a - b);
-    const groups = [];
-    if (xStarts.length) {
-      let cur = xStarts[0], cnt = 1;
-      for (let i = 1; i < xStarts.length; i++) {
-        if (xStarts[i] - cur < 5) cnt++; 
-        else { groups.push({ x: cur, cnt }); cur = xStarts[i]; cnt = 1; }
-      }
-      groups.push({ x: cur, cnt });
-    }
-    // More sensitive: Consider any X-start that appears at least twice or in 5% of rows
-    const colStarts = groups.filter(g => g.cnt >= Math.min(2, Math.max(1, rows.length * 0.05))).map(g => g.x).sort((a, b) => a - b);
+    const pageText = tc.items.map(it => it.str).join(" ").toLowerCase();
+    const isElectoralPage = pageText.includes("elector") || pageText.includes("relationship") || pageText.includes("epic no");
 
-    // Assign each item to the nearest column start
-    const structuredRows = rows.map(r => {
-      const rowCells = new Array(Math.max(1, colStarts.length)).fill("");
-      r.items.sort((a, b) => a.transform[4] - b.transform[4]);
-      let lastX = -1, lastCol = -1;
-      r.items.forEach(it => {
-        const x = it.transform[4];
-        let colIdx = 0;
-        for (let i = 0; i < colStarts.length; i++) { if (x >= colStarts[i] - 2) colIdx = i; else break; }
-        
-        // Stricter force for same column (within 4 units)
-        if (lastX !== -1 && (x - lastX) < 4 && lastCol !== -1) colIdx = lastCol;
-        
-        rowCells[colIdx] += (rowCells[colIdx] ? " " : "") + it.str;
-        lastX = x + (it.width || 0); lastCol = colIdx;
+    let structuredRows;
+    if (isElectoralPage) {
+      structuredRows = rows.map(r => {
+        const bins = new Array(8).fill("");
+        r.items.sort((a, b) => a.transform[4] - b.transform[4]);
+        r.items.forEach(it => {
+          if (!it.str.trim()) return;
+          const x = it.transform[4];
+          let binIdx = -1;
+          if (x < 90) binIdx = 0;
+          else if (x >= 90 && x < 125) binIdx = 1;
+          else if (x >= 125 && x < 240) binIdx = 2;
+          else if (x >= 240 && x < 295) binIdx = 3;
+          else if (x >= 295 && x < 420) binIdx = 4;
+          else if (x >= 420 && x < 460) binIdx = 5;
+          else if (x >= 460 && x < 480) binIdx = 6;
+          else binIdx = 7;
+          
+          bins[binIdx] += (bins[binIdx] ? " " : "") + it.str;
+        });
+        return bins;
       });
-      return rowCells;
-    });
+    } else {
+      // Global Column Alignment: find common X-starts that occur across rows
+      const xStarts = tc.items.map(it => it.transform[4]).sort((a, b) => a - b);
+      const groups = [];
+      if (xStarts.length) {
+        let cur = xStarts[0], cnt = 1;
+        for (let i = 1; i < xStarts.length; i++) {
+          if (xStarts[i] - cur < 5) cnt++; 
+          else { groups.push({ x: cur, cnt }); cur = xStarts[i]; cnt = 1; }
+        }
+        groups.push({ x: cur, cnt });
+      }
+      const colStarts = groups.filter(g => g.cnt >= Math.min(2, Math.max(1, rows.length * 0.05))).map(g => g.x).sort((a, b) => a - b);
 
-    // Post-process structuredRows to split merged Address & Elector Name
+      // Assign each item to the nearest column start
+      structuredRows = rows.map(r => {
+        const rowCells = new Array(Math.max(1, colStarts.length)).fill("");
+        r.items.sort((a, b) => a.transform[4] - b.transform[4]);
+        let lastX = -1, lastCol = -1;
+        r.items.forEach(it => {
+          if (!it.str.trim()) return;
+          const x = it.transform[4];
+          let colIdx = 0;
+          for (let i = 0; i < colStarts.length; i++) { if (x >= colStarts[i] - 2) colIdx = i; else break; }
+          const diff = x - lastX;
+          if (lastX !== -1 && diff < 5 && diff > -2 && lastCol !== -1) colIdx = lastCol;
+          
+          rowCells[colIdx] += (rowCells[colIdx] ? " " : "") + it.str;
+          lastX = x + (it.width || 0); lastCol = colIdx;
+        });
+        return rowCells;
+      });
+    }
+
+    // Post-process structuredRows to split merged Address & Elector Name (fallback safety)
     let electorNameColIdx = -1;
     let houseNoColIdx = -1;
     for (let rIdx = 0; rIdx < Math.min(10, structuredRows.length); rIdx++) {
@@ -1329,6 +1355,14 @@ function buildCard({ fileInfo, matches }, terms, index) {
             }
             finalHead[0] = dynamicHeader;
           }
+        }
+      }
+
+      if (finalHead && finalHead.length === 8) {
+        const isElectorTable = finalHead.some(h => /elector|relation|epic|sex|gender|slno|sl\.no/i.test(h)) || 
+                               displayRows.some(row => row.some(cell => /AN\/\d+|^[A-Z]{3}\d+/i.test(cell)));
+        if (isElectorTable) {
+          finalHead = ["Sl. No.", "House No.", "Name of Elector", "Relationship", "Name of Relation", "Sex", "Age", "EPIC No."];
         }
       }
 
